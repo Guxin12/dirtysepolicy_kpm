@@ -838,16 +838,23 @@ static bool should_bypass_clean_filter(uid_t uid)
         return true;
 
     /*
-     * Let the policy management path see and write the live policy.  Otherwise
-     * magiskpolicy/apd may read the clean snapshot as its baseline and lose
-     * rules it is trying to install.
+     * v0.1.6 (T11): comm 白名单已整体废弃——comm 可被任意 app 经
+     * prctl(PR_SET_NAME) 伪造(春秋检测器 :apd 探针即借此穿透拿到
+     * live 策略, 与 clean 视图形成差分)。真正的策略管理器
+     * (magiskpolicy/apd/ksud) 均以 uid 0 运行, 已被上面的 uid 规则
+     * 覆盖, 不存在把 clean 快照当加载基线的丢规则问题。
      */
-    return current_is_policy_manager();
+    return false;
 }
 
 static bool should_log_live_bypass(uid_t uid)
 {
-    return uid >= 10000 || current_is_policy_manager();
+    /*
+     * v0.1.6 (T11): uid-only 信任下 uid>=10000 的 LIVE 穿透不应再发生;
+     * 保留该日志作哨兵——dmesg 中一旦出现 "LIVE bypass uid>=10000"
+     * 即说明信任判定被绕过, 需立即排查。
+     */
+    return uid >= 10000;
 }
 
 static bool use_clean_blob_route(void)
@@ -877,14 +884,12 @@ static bool clean_policydb_redirect_supported(void)
 
 static bool current_is_policy_manager(void)
 {
-    const char *comm = current_comm();
-
-    if (str_eq_lit(comm, "magiskpolicy") ||
-        str_eq_lit(comm, "apd") ||
-        str_eq_lit(comm, "truncate"))
-        return true;
-
-    return false;
+    /*
+     * v0.1.6 (T11): uid-only 信任。comm(magiskpolicy/apd/truncate 等)可被
+     * 任意进程经 prctl(PR_SET_NAME) 伪造, 不再作为信任依据;
+     * 策略管理器均以 uid 0 运行, uid 规则已将其覆盖。
+     */
+    return current_uid() < 10000;
 }
 
 static u32 *bypass_counter_for_node(const char *node)
