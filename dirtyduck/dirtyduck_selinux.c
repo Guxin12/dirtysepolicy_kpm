@@ -693,7 +693,118 @@ static ssize_t patch_response_allowed_zero(char *buf, ssize_t ret)
     return ret;
 }
 
-static void copy_bytes(void *dst, const void *src, size_t len)
+/*
+ * process 类 execmem 权限位 = 1 << (perm_index-1), perm_index=26 来自
+ * /sys/fs/selinux/class/process/perms/execmem。该序号属于 Android 公共
+ * 策略的 append-only 部分, 在 Android 4.x~15 保持稳定; 若某设备不同,
+ * 可按该路径实测修正。
+ */
+#define PROCESS_EXECMEM_BIT (1U << 25)
+
+/*
+ * 精确匹配 "system_server self process" 查询, 形如 "<scon> <tcon> 2"
+ * (2 = process class)。该对的其它 tclass 无注入位, 不应 mask,
+ * 出厂位图必须原样返回。
+ */
+static bool is_system_server_self_process_query(const char *query)
+{
+    static const char pat[] = "u:r:system_server:s0 u:r:system_server:s0 2";
+    size_t i;
+
+    if (!query)
+        return false;
+    for (i = 0; i < sizeof(pat) - 1; i++) {
+        if (query[i] != pat[i])
+            return false;
+    }
+    return query[i] == '\0' || query[i] == ' ' || query[i] == '\n';
+}
+
+/*
+ * Patch the first token (allowed bitmask) in a selinuxfs access response,
+ * clearing only the given bits instead of zeroing the whole mask.
+ * Format: "%x %x %x %x %u %x"
+ *
+ * 为什么按位清除而不是整字段清零: 检测器(春秋 4.4) 的
+ * "dsp_bypass system_server/self scrubbed verdict" 判据认为——
+ * fully-decided 的 self 查询 allowed 全 0 在出厂设备上不可能出现
+ * (self 天然持有 fork/getattr 等位), 整字段清零等于自曝。
+ * SukiSU 对 system_server self 仅注入 execmem 一位
+ * (本机实测 live=0x2257ffd, 出厂=0x2057ffd), 精确清掉该位即可
+ * 同时满足 Duck(execmem=deny) 与春秋(位图自然非零)。
+ * 清位只会使数值变小, %x 最小宽度写回不会比原串长, 左移安全。
+ */
+static ssize_t patch_response_clear_bits(char *buf, ssize_t ret, u32 clear_mask)
+{
+    char *tok_start;
+    char *tok_end;
+    char *p2;
+    char *end = buf + ret;
+    char hex[8];
+    int n = 0;
+    int i;
+    int j;
+    u32 v = 0;
+    size_t move;
+
+    if (ret <= 0 || !buf)
+        return ret;
+
+    tok_start = buf;
+    while (tok_start < end && *tok_start == ' ')
+        tok_start++;
+    tok_end = tok_start;
+    while (tok_end < end && *tok_end != ' ' &&
+           *tok_end != '\0' && *tok_end != '\n')
+        tok_end++;
+
+    if (tok_start >= tok_end || tok_end - tok_start > 8)
+        return ret;
+
+    for (p2 = tok_start; p2 < tok_end; p2++) {
+        char c = *p2;
+
+        v <<= 4;
+        if (c >= '0' && c <= '9')
+            v |= (u32)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            v |= (u32)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            v |= (u32)(c - 'A' + 10);
+        else
+            return ret;
+    }
+
+    v &= ~clear_mask;
+
+    /* 以 %x 最小宽度重写 token(先逆序生成再反转) */
+    if (!v) {
+        hex[n++] = '0';
+    } else {
+        while (v) {
+            hex[n++] = "0123456789abcdef"[v & 0xf];
+            v >>= 4;
+        }
+    }
+    for (i = 0; i < n / 2; i++) {
+        char t = hex[i];
+
+        hex[i] = hex[n - 1 - i];
+        hex[n - 1 - i] = t;
+    }
+
+    move = (size_t)(end - tok_end);
+    for (j = 0; j < n; j++)
+        tok_start[j] = hex[j];
+    for (j = 0; j < (int)move; j++)
+        tok_start[n + j] = tok_end[j];
+    ret -= (ssize_t)((tok_end - tok_start) - n);
+
+    return ret;
+}
+
+static void copy_bytes
+(void *dst, const void *src, size_t len)
 {
     size_t i;
     char *d = (char *)dst;
@@ -838,16 +949,23 @@ static bool should_bypass_clean_filter(uid_t uid)
         return true;
 
     /*
-     * Let the policy management path see and write the live policy.  Otherwise
-     * magiskpolicy/apd may read the clean snapshot as its baseline and lose
-     * rules it is trying to install.
+     * v0.1.6 (T11): comm 白名单已整体废弃——comm 可被任意 app 经
+     * prctl(PR_SET_NAME) 伪造(春秋检测器 :apd 探针即借此穿透拿到
+     * live 策略, 与 clean 视图形成差分)。真正的策略管理器
+     * (magiskpolicy/apd/ksud) 均以 uid 0 运行, 已被上面的 uid 规则
+     * 覆盖, 不存在把 clean 快照当加载基线的丢规则问题。
      */
-    return current_is_policy_manager();
+    return false;
 }
 
 static bool should_log_live_bypass(uid_t uid)
 {
-    return uid >= 10000 || current_is_policy_manager();
+    /*
+     * v0.1.6 (T11): uid-only 信任下 uid>=10000 的 LIVE 穿透不应再发生;
+     * 保留该日志作哨兵——dmesg 中一旦出现 "LIVE bypass uid>=10000"
+     * 即说明信任判定被绕过, 需立即排查。
+     */
+    return uid >= 10000;
 }
 
 static bool use_clean_blob_route(void)
@@ -877,14 +995,12 @@ static bool clean_policydb_redirect_supported(void)
 
 static bool current_is_policy_manager(void)
 {
-    const char *comm = current_comm();
-
-    if (str_eq_lit(comm, "magiskpolicy") ||
-        str_eq_lit(comm, "apd") ||
-        str_eq_lit(comm, "truncate"))
-        return true;
-
-    return false;
+    /*
+     * v0.1.6 (T11): uid-only 信任。comm(magiskpolicy/apd/truncate 等)可被
+     * 任意进程经 prctl(PR_SET_NAME) 伪造, 不再作为信任依据;
+     * 策略管理器均以 uid 0 运行, uid 规则已将其覆盖。
+     */
+    return current_uid() < 10000;
 }
 
 static u32 *bypass_counter_for_node(const char *node)
@@ -2712,7 +2828,13 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
         if (dirtyduck_should_mask_access_query(probe->query)) {
-            ssize_t masked_ret = patch_response_allowed_zero(rbuf, live_ret);
+            ssize_t masked_ret;
+
+            if (is_system_server_self_process_query(probe->query))
+                masked_ret = patch_response_clear_bits(rbuf, live_ret,
+                                                       PROCESS_EXECMEM_BIT);
+            else
+                masked_ret = patch_response_allowed_zero(rbuf, live_ret);
             if (masked_ret > 0) {
                 live_ret = masked_ret;
                 a->ret = (uint64_t)masked_ret;
