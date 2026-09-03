@@ -52,8 +52,8 @@
   - `comm=apd` 探针进程 77 条查询全部走 CLEAN 通道、**0 条 LIVE bypass**（后门关闭）
   - 哨兵 `LIVE bypass uid>=10000` = 0
   - 非法上下文（chunqiu_context_oracle_sentinel 等）全部 EINVAL（-22）
-- [ ] 春秋 UI【检测SELinux Policy时发现可疑问题】消失——待用户目检
-- [ ] Duck 全绿——待用户目检（AVC "Exposed" 项为预期内残留：geekbyte-hide 未加载，
+- [x] 春秋 UI SELinux 项消失——用户目检确认通过(2026-09-03)
+- [x] Duck SELinux 项通过——用户目检确认(2026-09-03; AVC/Audit 项属 geekbyte-hide 范围)（AVC "Exposed" 项为预期内残留：geekbyte-hide 未加载，
       不在本期范围）
 
 ### T5 回滚预案
