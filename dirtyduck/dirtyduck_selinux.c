@@ -36,7 +36,7 @@
 #ifdef DIRTYDUCK_VERSION_VALUE
 #define DIRTYDUCK_VERSION KPM_STR(DIRTYDUCK_VERSION_VALUE)
 #else
-#define DIRTYDUCK_VERSION "0.1.5"
+#define DIRTYDUCK_VERSION "0.1.7"
 #endif
 #endif
 
@@ -2183,6 +2183,37 @@ static bool query_has_pair(const char *query, size_t len,
            contains_case_lit(query, len, tcon, token_len(tcon));
 }
 
+/*
+ * v0.1.7: 存在性查询判定 —— 形如 "<scon> <tcon> 0"。
+ *
+ * tclass=0 不是合法的属性类, 只有 "某个 context 是否存在" 这一路探测会这样
+ * 写: TrustAttestor dirty_sepolicy ContextExists() 的第②步
+ * (checker_sepolicy.cpp: QueryAccessVector(context, context, 0, ...))、
+ * 以及 DuckDetector context_validity_probe 的 sentinel 控制组。
+ *
+ * 这类查询必须按原生语义回答: context 在干净策略里不存在 ⇒ EINVAL。旧实现
+ * 走通用 mask 分支, 返回 "allowed 清零 + 成功", 等于直接告诉探测方
+ * "context 存在"(检测器只判断查询成功与否, 不看 allowed 位), 而真机上不存在
+ * 的类型本来就写不进去。
+ */
+static bool query_is_existence_probe(const char *query, size_t len)
+{
+    const char *cls;
+
+    if (!query || !len)
+        return false;
+
+    cls = next_token(query);        /* 跳过 scon, 取 tcon */
+    if (!cls || !*cls)
+        return false;
+    cls = next_token(cls);          /* 取 tclass */
+    if (!cls || cls[0] != '0')
+        return false;
+
+    return cls[1] == '\0' || cls[1] == ' ' || cls[1] == '\n' ||
+           cls[1] == '\r' || cls[1] == '\t';
+}
+
 static bool dirtyduck_should_block_context_query(const char *query, size_t len)
 {
     return legacy_should_block_access_query(query, len);
@@ -2226,6 +2257,28 @@ static bool dirtyduck_should_mask_access_query(const char *query)
     if (query_has_pair(query, len, "u:r:fsck:s0", "u:r:fsck:s0"))
         return true;
     if (query_has_pair(query, len, "u:r:fsck_untrusted:s0", "u:r:fsck_untrusted:s0"))
+        return true;
+
+    /*
+     * v0.1.7 P0-2: TEESimulator-RS(TrickyStore 的 TEE 模拟器)为了让 keystore
+     * 读取伪造的 adb/shell 数据文件, 会往策略里注入
+     *   keystore → adb_data_file   file *
+     *   keystore → shell_data_file file *
+     * (本机 live 实测 allowed=0xffffffff)。TrustAttestor 的
+     * teesim_keystore_policy 判据就是这组 pair 的 read+map+execute
+     * (checker_sepolicy.cpp ProbeKeystoreFileAccess), DuckDetector /
+     * 春秋同族探测也走这组 pair。
+     *
+     * 两个 context(keystore / adb_data_file / shell_data_file)都是出厂标签,
+     * 必须继续保持 "存在", 所以不能走上面的关键字/存在性 EINVAL 路线, 只能在
+     * 回应位图上把被注入的授权清掉。出厂策略对这两条 pair 没有任何授权
+     * (allowed=0), 因此清零 allowed 与出厂设备完全一致; 这里不是
+     * patch_response_clear_bits 注释里警告的 "self/fork 类自曝形态" ——
+     * 那种形态的问题在于出厂值非 0, 而这两条 pair 的出厂值就是 0。
+     */
+    if (query_has_pair(query, len, "u:r:keystore:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+    if (query_has_pair(query, len, "u:r:keystore:s0", "u:object_r:shell_data_file:s0"))
         return true;
 
     return false;
@@ -2690,8 +2743,25 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
-    if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
-        legacy_should_block_access_query(sample, sample_len)) {
+    /*
+     * v0.1.7 P0-1: 与 context 节点(dirtyduck_should_block_context_query)
+     * 使用同一判据 —— 关键字家族 (旧实现只在没有 clean policydb 的 blob 路线
+     * 下才走这一步) 与 "干净策略里不存在的 context" 在任何 selinuxfs 查询上
+     * 的原生答案都是 EINVAL: 出厂设备上这些类型确实不存在, 写不进去。
+     *
+     * 旧实现在 clean policydb 可用时改成 "allowed 清零 + 成功返回", 而
+     * TrustAttestor dirty_sepolicy 的 ContextExists() 第②步只判断查询是否
+     * 成功 (checker_sepolicy.cpp: if (access_result == QueryResult::Ok)
+     * return ContextResult::Exists;), 于是恰好把 magisk_file / ksu 判成
+     * "context 存在" → magisk_policy / kernelsu_policy 命中。
+     *
+     * 存在性查询("<ctx> <ctx> 0")额外做一次干净策略存在性核对: blob 扫描只在
+     * 这个形状上触发, 不落在权限查询热路径, 而它保证不会向探测方伪造
+     * "context 存在" 的成功响应。
+     */
+    if (legacy_should_block_access_query(sample, sample_len) ||
+        (query_is_existence_probe(sample, sample_len) &&
+         legacy_clean_query_should_block(sample, sample_len, true))) {
         a->local.data0 = 2;
         a->local.data1 = n;
         slot = n & (ACCESS_PROBE_SLOTS - 1);
@@ -3096,8 +3166,18 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
             clean_ret = -EINVAL;
             n = READ_ONCE(g_procattr_nonstock_block_count) + 1;
             WRITE_ONCE(g_procattr_nonstock_block_count, n);
-        } else if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
-            legacy_should_block_access_query(sample, sample_len)) {
+        } else if (legacy_should_block_access_query(sample, sample_len)) {
+            /*
+             * v0.1.7 P0-1: 去掉 "!g_clean_policydb" 前置条件, 与 context /
+             * access 两个节点保持同一判据。
+             *
+             * 旧实现在 clean policydb 可用时把关键字家族交给
+             * clean_policy_context_to_sid() 判定, 而本机基线 policydb 是已打过
+             * 补丁的 live 策略(含 ksu/magisk 类型) → 返回 0(存在) → 写操作落到
+             * 真实内核 → context 能解析但 dyntransition 被拒 → EPERM/EACCES,
+             * 而检测器正是把 EPERM/EACCES 当作 "context 存在"。
+             * 这些类型在出厂策略里不存在, 原生答案就是 EINVAL。
+             */
             clean_checked = true;
             clean_ret = -EINVAL;
         } else {
